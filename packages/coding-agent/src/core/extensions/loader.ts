@@ -67,6 +67,24 @@ const VIRTUAL_MODULES: Record<string, unknown> = {
 };
 
 const require = createRequire(import.meta.url);
+let extensionJiti: ReturnType<typeof createJiti> | undefined;
+
+function getExtensionJiti(): ReturnType<typeof createJiti> {
+	if (!extensionJiti) {
+		extensionJiti = createJiti(import.meta.url, {
+			// Keep jiti's module cache enabled so dependencies are evaluated once across
+			// extension reloads. loadExtensionModule explicitly evicts extension-owned
+			// modules while preserving nested node_modules entries, which lets /reload
+			// pick up extension edits without re-running dependency module side effects.
+			moduleCache: true,
+			// In Bun binary: use virtualModules for bundled packages (no filesystem resolution)
+			// Also disable tryNative so jiti handles ALL imports (not just the entry point)
+			// In Node.js/dev: use aliases to resolve to node_modules paths
+			...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
+		});
+	}
+	return extensionJiti;
+}
 
 /**
  * Get aliases for jiti (used in Node.js/development mode).
@@ -371,6 +389,27 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
+function getNodeModulesPackageRoot(modulePath: string): string | undefined {
+	const parts = modulePath.split(path.sep);
+	const nodeModulesIndex = parts.lastIndexOf("node_modules");
+	if (nodeModulesIndex === -1 || nodeModulesIndex + 1 >= parts.length) {
+		return undefined;
+	}
+	const packageEndIndex = parts[nodeModulesIndex + 1]?.startsWith("@") ? nodeModulesIndex + 3 : nodeModulesIndex + 2;
+	return parts.slice(0, packageEndIndex).join(path.sep);
+}
+
+function clearExtensionOwnedModuleCache(extensionPath: string): void {
+	const packageRoot = getNodeModulesPackageRoot(extensionPath);
+	const reloadRoot = packageRoot ?? path.dirname(extensionPath);
+	for (const cachePath of Object.keys(require.cache)) {
+		const relativePath = path.relative(reloadRoot, cachePath);
+		if (relativePath !== "" && (relativePath.startsWith("..") || path.isAbsolute(relativePath))) continue;
+		if (relativePath.split(path.sep).includes("node_modules")) continue;
+		delete require.cache[cachePath];
+	}
+}
+
 async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
@@ -379,15 +418,8 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		}
 	}
 
-	const jiti = createJiti(import.meta.url, {
-		moduleCache: false,
-		// In Bun binary: use virtualModules for bundled packages (no filesystem resolution)
-		// Also disable tryNative so jiti handles ALL imports (not just the entry point)
-		// In Node.js/dev: use aliases to resolve to node_modules paths
-		...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
-	});
-
-	const module = await jiti.import(extensionPath, { default: true });
+	clearExtensionOwnedModuleCache(extensionPath);
+	const module = await getExtensionJiti().import(extensionPath, { default: true });
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;
